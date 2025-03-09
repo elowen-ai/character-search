@@ -151,6 +151,10 @@ class CharacterSearch:
 
         # Sort by confidence
         results.sort(key=lambda x: x[1], reverse=True)
+
+        # If most confident result is below a certain threshold, return no results
+        if results and results[0][1] < 32:
+            return []
         return results[:top_k]
 
 def main():
