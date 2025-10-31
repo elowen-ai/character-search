@@ -1,12 +1,14 @@
 import os
 import time
 import faiss
+import hashlib
 import numpy as np
 from dotenv import load_dotenv
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from functools import lru_cache
 from rapidfuzz import fuzz, process
 from cassandra.cluster import Cluster
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -21,6 +23,8 @@ class CharacterSearch:
         self.name_lookup = {}
         self.min_faiss_distance = float("inf")
         self.max_faiss_distance = 0
+        self.search_cache = {}
+        self.cache_ttl = 300
 
     def connect_db(self):
         try:
@@ -34,7 +38,7 @@ class CharacterSearch:
             self.cluster.shutdown()
 
     @staticmethod
-    def normalize_name(name: str) -> str:
+    def normalize_name(name: str) -> List[str]:
         words = name.lower().split()
         sorted_version = " ".join(sorted(words))
         original_version = " ".join(words)
@@ -53,7 +57,8 @@ class CharacterSearch:
         return vector / (len(text) + 1)
 
     def build_index(self):
-        if not self.session: self.connect_db()
+        if not self.session: 
+            self.connect_db()
 
         try:
             rows = self.session.execute("SELECT name FROM characters;")
@@ -62,19 +67,16 @@ class CharacterSearch:
             if not self.character_names:
                 raise ValueError("No character names found in the database")
 
-            # Normalize names and create lookup dictionary
             self.name_lookup = {}
             for name in self.character_names:
                 for variant in self.normalize_name(name):
                     self.name_lookup[variant] = name
 
-            # Build FAISS Index
-            unique_names = list(set(self.name_lookup.values()))  # Remove duplicates
+            unique_names = list(set(self.name_lookup.values()))
             vectors = np.array([self.text_to_vector(name) for name in unique_names])
             self.index = faiss.IndexFlatL2(512)
             self.index.add(vectors)
 
-            # Precompute min and max FAISS distances for normalization
             distances, _ = self.index.search(vectors, 1)
             self.min_faiss_distance = np.min(distances)
             self.max_faiss_distance = np.max(distances)
@@ -87,40 +89,40 @@ class CharacterSearch:
     def normalize_faiss_distance(self, distance: float) -> float:
         if self.max_faiss_distance == self.min_faiss_distance:
             return 0
-        return max(0, 100 - ((distance - self.min_faiss_distance) / (self.max_faiss_distance - self.min_faiss_distance) * 100))
+        return max(0, 100 - ((distance - self.min_faiss_distance) / 
+                             (self.max_faiss_distance - self.min_faiss_distance) * 100))
 
-    @lru_cache(maxsize=1000)
-    def search(self, query: str, top_k: int = 3, alpha: float = 0.7) -> List[Tuple[str, float]]:
-        """
-        Searches for the closest character names using:
-        - Exact name match (priority)
-        - Fuzzy matching
-        - FAISS vector search
-        - Substring matching (lower priority)
-        """
+    def _generate_cache_key(self, query: str, alpha: float) -> str:
+        return hashlib.md5(f"{query.lower()}:{alpha}".encode()).hexdigest()
+
+    def _clean_expired_cache(self):
+        current_time = datetime.now()
+        expired_keys = [
+            key for key, (_, timestamp) in self.search_cache.items()
+            if (current_time - timestamp).total_seconds() > self.cache_ttl
+        ]
+        for key in expired_keys:
+            del self.search_cache[key]
+
+    def _get_all_results(self, query: str, alpha: float = 0.7) -> List[Tuple[str, float]]:
         if not self.index or not self.character_names:
             raise RuntimeError("Search index not built. Call build_index() first.")
 
         query = query.strip()
         results = []
-
-        # Generate normalized versions of the query
         query_variants = self.normalize_name(query)
 
-        # 1. **Exact Match Check** (Highest Priority)
         for variant in query_variants:
             if variant in self.name_lookup:
                 return [(self.name_lookup[variant], 100.0)]
 
-        # 2. **Fuzzy Matching**
         fuzzy_matches = process.extract(
-            query, self.character_names, scorer=fuzz.ratio, limit=top_k
+            query, self.character_names, scorer=fuzz.ratio, limit=50
         )
         fuzzy_results = {match[0]: match[1] for match in fuzzy_matches}
 
-        # 3. **FAISS Search**
         query_vector = np.array([self.text_to_vector(query_variants[0])])
-        distances, indices = self.index.search(query_vector, top_k)
+        distances, indices = self.index.search(query_vector, 50)
 
         faiss_results = {}
         for idx, dist in zip(indices[0], distances[0]):
@@ -129,12 +131,10 @@ class CharacterSearch:
                 faiss_score = self.normalize_faiss_distance(dist)
                 faiss_results[name] = faiss_score
 
-        # 4. **Substring Match (Lower Priority)**
         substring_results = {
             name: 80 for name in self.character_names if query.lower() in name.lower()
         }
 
-        # Merge Results
         all_names = set(fuzzy_results.keys()).union(
             set(faiss_results.keys()), set(substring_results.keys())
         )
@@ -143,19 +143,63 @@ class CharacterSearch:
             faiss_score = faiss_results.get(name, 0)
             substring_score = substring_results.get(name, 0)
 
-            # Combine scores with priority: Exact > Fuzzy > FAISS > Substring
             final_score = (
                 max(fuzzy_score, substring_score) * alpha + faiss_score * (1 - alpha)
             )
             results.append((name, final_score))
 
-        # Sort by confidence
         results.sort(key=lambda x: x[1], reverse=True)
+        results = [r for r in results if r[1] >= 32]
+        
+        return results
 
-        # If most confident result is below a certain threshold, return no results
-        if results and results[0][1] < 32:
-            return []
-        return results[:top_k]
+    def search_paginated(
+        self, 
+        query: str, 
+        page: int = 1, 
+        page_size: int = 10, 
+        alpha: float = 0.7
+    ) -> Dict:
+        if len(self.search_cache) > 100:
+            self._clean_expired_cache()
+        
+        cache_key = self._generate_cache_key(query, alpha)
+        
+        if cache_key in self.search_cache:
+            all_results, _ = self.search_cache[cache_key]
+        else:
+            all_results = self._get_all_results(query, alpha)
+            self.search_cache[cache_key] = (all_results, datetime.now())
+        
+        total_results = len(all_results)
+        total_pages = (total_results + page_size - 1) // page_size
+        
+        if page < 1:
+            page = 1
+        if page > total_pages and total_pages > 0:
+            page = total_pages
+        
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_results = all_results[start_idx:end_idx]
+        
+        return {
+            "results": page_results,
+            "pagination": {
+                "current_page": page,
+                "page_size": page_size,
+                "total_results": total_results,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_previous": page > 1
+            },
+            "query": query
+        }
+
+    @lru_cache(maxsize=1000)
+    def search(self, query: str, top_k: int = 3, alpha: float = 0.7) -> List[Tuple[str, float]]:
+        all_results = self._get_all_results(query, alpha)
+        return all_results[:top_k]
 
 def main():
     searcher = CharacterSearch()
@@ -168,12 +212,32 @@ def main():
         query = input("\nEnter character name (or 'q' to quit): ")
         if query.lower() == 'q':
             break
+            
+        page_input = input("Enter page number (default 1): ")
+        page = int(page_input) if page_input.strip() else 1
+        
+        page_size_input = input("Enter page size (default 10): ")
+        page_size = int(page_size_input) if page_size_input.strip() else 10
+        
         start_time = time.time()
-        matches = searcher.search(query)
+        result = searcher.search_paginated(query, page=page, page_size=page_size)
         search_time = time.time() - start_time
-        print(f"\nResults (found in {search_time:.3f} seconds):")
-        for name, confidence in matches:
+        
+        print(f"\n{'='*60}")
+        print(f"Results for '{result['query']}' (found in {search_time:.3f} seconds):")
+        print(f"Page {result['pagination']['current_page']} of {result['pagination']['total_pages']}")
+        print(f"Total results: {result['pagination']['total_results']}")
+        print(f"{'='*60}\n")
+        
+        for name, confidence in result['results']:
             print(f"- {name} (confidence: {confidence:.1f}%)")
+        
+        print(f"\n{'='*60}")
+        if result['pagination']['has_previous']:
+            print(f"Previous page available")
+        if result['pagination']['has_next']:
+            print(f"Next page available")
+
 
 if __name__ == "__main__":
     main()
